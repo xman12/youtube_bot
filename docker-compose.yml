@@ -1,0 +1,161 @@
+
+
+services:
+  # Telegram Bot API Server
+  telegram-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+    command: >
+      --api-id=${TELEGRAM_API_ID}
+      --api-hash=${TELEGRAM_API_HASH}
+      --local
+      --http-port=8081
+    volumes:
+      - telegram_api_data:/var/lib/telegram-bot-api
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # YouTube Bot Service
+  youtube-bot:
+    build: .
+    container_name: youtube-bot
+    environment:
+      - TELEGRAM_API_TOKEN=${TELEGRAM_API_TOKEN}
+      - TELEGRAM_API_URL=${TELEGRAM_API_URL}
+      - DB_LOGIN=${DB_LOGIN}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_NAME=${DB_NAME}
+      - PATH_TO_PROXY=${PATH_TO_PROXY}
+      - PATH_TO_LOAD_VIDEO=${PATH_TO_LOAD_VIDEO}
+      - PATH_TO_LOAD_AUDIO=${PATH_TO_LOAD_AUDIO}
+      - PATH_TO_LOAD_IMG=${PATH_TO_LOAD_IMG}
+      - CLEANUP_INTERVAL_SECONDS=${CLEANUP_INTERVAL_SECONDS:-3600}
+      - CLEANUP_AGE_HOURS=${CLEANUP_AGE_HOURS:-2}
+    volumes:
+      - ${PATH_TO_LOAD_VIDEO}:/tmp/videos
+      - ${PATH_TO_LOAD_AUDIO}:/tmp/audio
+      - ${PATH_TO_LOAD_IMG}:/tmp/images
+      - ${PATH_TO_PROXY}:/root/proxy_files/proxy.txt
+    networks:
+      - monitoring
+    depends_on:
+      - mysql
+      - telegram-api
+    restart: unless-stopped
+
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    container_name: youtube-bot-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_LOGIN}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DEFAULT_AUTHENTICATION_PLUGIN: mysql_native_password
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+      - ./db_export:/docker-entrypoint-initdb.d
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      - monitoring
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  # Nginx Reverse Proxy with IP restrictions
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    ports:
+      - "3000:3000"   # Grafana
+      - "8081:8081"   # Telegram Bot API
+      - "8090:8090"   # YouTube Bot API
+      - "9090:9090"   # Prometheus
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - monitoring
+    depends_on:
+      - mysql
+      - prometheus
+      - grafana
+      - youtube-bot
+      - telegram-api
+    restart: unless-stopped
+
+  # MySQL Access Control
+  mysql-proxy:
+    image: alpine:latest
+    container_name: mysql-proxy
+    ports:
+      - "3306:3306"
+    command: >
+      sh -c "
+        apk add --no-cache iptables socat &&
+        echo '🔧 Настройка iptables для ограничения доступа к MySQL...' &&
+        iptables -A INPUT -p tcp --dport 3306 -s 111.111.111.111 -j ACCEPT &&
+        iptables -A INPUT -p tcp --dport 3306 -s 127.0.0.1 -j ACCEPT &&
+        iptables -A INPUT -p tcp --dport 3306 -s 10.0.0.0/8 -j ACCEPT &&
+        iptables -A INPUT -p tcp --dport 3306 -s 172.16.0.0/12 -j ACCEPT &&
+        iptables -A INPUT -p tcp --dport 3306 -s 192.168.0.0/16 -j ACCEPT &&
+        iptables -A INPUT -p tcp --dport 3306 -j DROP &&
+        echo 'iptables правила настроены' &&
+        echo 'Запуск MySQL прокси на порту 3306...' &&
+        socat TCP-LISTEN:3306,fork TCP:mysql:3306
+      "
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - monitoring
+    depends_on:
+      - mysql
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  telegram_api_data:
+
+networks:
+  monitoring:
+    driver: bridge
+

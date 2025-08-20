@@ -1,0 +1,4 @@
+.idea
+backups
+mysql_data
+.env
